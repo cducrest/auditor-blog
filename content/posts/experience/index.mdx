@@ -1,0 +1,59 @@
+---
+title: Incorrectly casting interface experience
+date: 2023-02-20
+description: Experience about how solidity deals with incorrectly casted interface
+defer: false
+tags:
+  - Learning
+---
+
+A surprising result that was hinted at by [an issue on the Cooler audit](https://github.com/sherlock-audit/2023-01-cooler-judging/issues/223) 
+is that a call to a wrongly casted interface's function reverts. 
+
+We all knew that the function selector used to determine which function will be executed on a contract is the first four bytes of the hash of its signature: `keccak256(signature)[:4]`.
+The signature being the name of the function and the type of its arguments, i.e. `transfer(address,uint256)` for an ERC20 token transfer function. The signature does not take into account the returned
+value type.
+
+It is logical that a call using the wrong signature would fail. But it is less intuitive that a call to an interface providing the wrong return value also fails.
+
+The tested contract is the following:
+
+```solidity
+pragma solidity 0.8.17;
+
+
+contract ERC20 {
+    function transfer(address to, uint256 amount) public returns (bool) {
+        return true;
+    }
+}
+
+contract WrongERC20 {
+    bool public worked;
+
+    function transfer(address to, uint256 amount) public {
+        worked = true;
+    }
+}
+
+contract Test {
+    ERC20 public token;
+
+    constructor(address _token) {
+        token = ERC20(_token);
+    }
+
+    function callTransfer() public {
+        token.transfer(address(this), 0);
+    }
+}
+```
+
+The `Test` contract is initialized with the address of a `WrongERC20` contract. 
+When callTransfer() is called, the call reverts and the transaction fails.
+
+I believe the reason is that the code of `Test` attempts to decode the return value of `token.transfer()` as a boolean and reverts when it fails to do so (because there is no return value).
+
+This further justifies why if I switch the return values around and make `ERC20.transfer()` return nothing and `WrongERC20.transfer()` return a boolean, the call to `Test.callTransfer()` no longer
+reverts.
+
