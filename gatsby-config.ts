@@ -137,6 +137,7 @@ const config: GatsbyConfig = {
       },
     },
   ].filter(Boolean) as Array<PluginRef>,
+  pathPrefix: "/blog",
 }
 
 export default config
