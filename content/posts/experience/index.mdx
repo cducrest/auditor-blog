@@ -8,7 +8,7 @@ tags:
 ---
 
 A surprising result that was hinted at by [an issue on the Cooler audit](https://github.com/sherlock-audit/2023-01-cooler-judging/issues/223) 
-is that a call to a wrongly casted interface's function reverts. 
+is that a call to a wrongly casted interface's function may revert. 
 
 We all knew that the function selector used to determine which function will be executed on a contract is the first four bytes of the hash of its signature: `keccak256(signature)[:4]`.
 The signature being the name of the function and the type of its arguments, i.e. `transfer(address,uint256)` for an ERC20 token transfer function. The signature does not take into account the returned
@@ -40,11 +40,11 @@ contract Test {
     ERC20 public token;
 
     constructor(address _token) {
-        token = ERC20(_token);
+        token = ERC20(_token);  // initialized with WrongERC20 address
     }
 
     function callTransfer() public {
-        token.transfer(address(this), 0);
+        token.transfer(address(this), 0);  // will revert
     }
 }
 ```
@@ -52,8 +52,40 @@ contract Test {
 The `Test` contract is initialized with the address of a `WrongERC20` contract. 
 When callTransfer() is called, the call reverts and the transaction fails.
 
-I believe the reason is that the code of `Test` attempts to decode the return value of `token.transfer()` as a boolean and reverts when it fails to do so (because there is no return value).
+I believe the reason is that the code of `Test` attempts to decode the return value of `token.transfer()` as a boolean and reverts when it fails to do so (because `WrongERC20.transfer()` returns no value).
 
 This further justifies why if I switch the return values around and make `ERC20.transfer()` return nothing and `WrongERC20.transfer()` return a boolean, the call to `Test.callTransfer()` no longer
 reverts.
 
+```solidity
+pragma solidity 0.8.17;
+
+
+contract ERC20 {
+    function transfer(address to, uint256 amount) public {
+        return true;
+    }
+}
+
+contract WrongERC20 {
+    bool public worked;
+
+    function transfer(address to, uint256 amount) public returns (bool) {
+        worked = true;
+    }
+}
+
+contract Test {
+    ERC20 public token;
+
+    constructor(address _token) {
+        token = ERC20(_token);  // initialized with WrongERC20 address
+    }
+
+    function callTransfer() public {
+        token.transfer(address(this), 0);  // will not revert
+    }
+}
+```
+
+In the above example, when `Test` is constructed with the address of a `WrongERC20` contract, the call to `callTransfer()` does not revert.
