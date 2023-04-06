@@ -11,7 +11,7 @@ const config: GatsbyConfig = {
     siteTitle: `cducrest Blog`,
     siteTitleAlt: `cducrest Blog`,
     siteHeadline: `cducrest Blog`,
-    siteUrl: `https://tbd.com`,
+    siteUrl: `https://cducrest.github.io/auditor-blog/`,
     siteDescription: `Blog about decentralised audit reports and web3 security from cducrest`,
     siteImage: ``,
     siteLanguage: `en`,
@@ -137,7 +137,7 @@ const config: GatsbyConfig = {
       },
     },
   ].filter(Boolean) as Array<PluginRef>,
-  pathPrefix: "/blog",
+  pathPrefix: "/auditor-blog",
 }
 
 export default config
