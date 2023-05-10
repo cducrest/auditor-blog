@@ -1,0 +1,306 @@
+---
+title: Hats audit result
+date: 2023-05-10
+description: Results of the Hats audit on Sherlock
+defer: false
+tags:
+  - Audit result
+  - Sherlock
+banner: ./hats.jpg
+---
+
+![hats](./hats.jpg)
+
+Hats is a protocol that can be used to organise roles of a DAO, their rights, and responsibilities.
+Hats are represented by a non-transferable ERC1155 token, wearers of a hat have a positive balance. 
+Hats are organised in a hierarchy, higher hats have admin rights to hats below them.
+
+The code was reviewed as part of the [Sherlock contest](https://app.sherlock.xyz/audits/contests/48).
+I ranked 3rd out of 152 participants in this audit. I found 3 high and 5 medium vulnerabilities, including one solo medium. I present my findings here.
+
+# High: Increase the number of valid signers past maxSigners
+
+## Summary
+
+The number of valid signers can be increased past maxSigners if users are added, their hats are toggled of so they are considered invalid signers, new signers are added reaching the `maxSigners` limit, and the hats of the previously inactive signers are toggled back on.
+
+## Vulnerability Detail
+
+`reconcileSignerCount()` does not remove inactive owners from the underlying safe, it simply updates the threshold and the `signerCount` value. 
+
+New users can be added with respect to the `maxSigners` constraint after signers have been made invalid by toggling their hats off and calling `reconcileSignerCount()`.
+
+Once the hats of the inactive users are turned back on, the number of valid signers on the underlying safe will go above `maxSigners` and checks like `if (currentSignerCount >= maxSigs) { revert ... }` will revert.
+
+## Impact
+
+The number of signers on the underlying safe may go above limits resulting in failing safe transaction / `reconcileSignerCount()` due to maxSigs checks.
+
+## Code Snippet
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L181-L183
+
+---------------------------------------
+
+# High: Move tree root to different tree without consent
+
+## Summary
+
+A tree root can be moved to a tree not within its current sub-tree without its explicit consent due to unfortunate ordering of actions.
+
+## Vulnerability Detail
+
+If a topHat `A` is grafted onto a tree with admin `B`, `requestLinkTopHatToTree()` can be called by `B` to request `A` be linked to a totally separate tree via admin `C`. 
+
+`B` or `C` cannot immediately accept the link request to of `A` to `C` since `_linkTopHatToTree()` the function that executes the link checks that if `A` is already linked, `C` must be in the same tree as `B`.
+
+However, if `B` calls `unlinkTopHatFromTree()` to be removed from the tree of `B`, `C` can immediately call `approveLinkTopHatToTree()` to link `A` to `C`.
+
+## Impact
+
+If a hat calls `unlinkTopHatFromTree()`, to remove one of its branch, other branch admins can sandwich the call with `requestLinkTopHatToTree()` and `approveLinkTopHatToTree()` to link it back to itself or to another tree with the help of another tree admin.
+
+Note that this is described under the assumption that `unlinkTopHatFromTree()` is called by admins of `A` which is untrue to docs but is the case in the code as I'll describe in another issue. The issue is still relevant if`unlinkTopHatFromTree()` can only be called by `A`.
+
+## Code Snippet
+
+No check of cross tree grafting in requestLinkTopHatToTree:
+
+https://github.com/Hats-Protocol/hats-protocol/blob/fafcfdf046c0369c1f9e077eacd94a328f9d7af0/src/Hats.sol#L726-L732
+
+Check of cross tree grafting is done here:
+
+https://github.com/Hats-Protocol/hats-protocol/blob/fafcfdf046c0369c1f9e077eacd94a328f9d7af0/src/Hats.sol#L761-L773
+
+## Recommendation
+
+Delete pending requests when ungrafting.
+
+```diff
+    function unlinkTopHatFromTree(uint32 _topHatDomain) external {
+        uint256 fullTopHatId = uint256(_topHatDomain) << 224; // (256 - TOPHAT_ADDRESS_SPACE);
+        _checkAdmin(fullTopHatId);
+
+        delete linkedTreeAdmins[_topHatDomain];
++       delete linkedTreeRequests[_topHatDomain];
+        emit TopHatLinked(_topHatDomain, 0);
+    }
+```
+
+---------------------------------------
+
+# High: checkAfterExecution threshold constraints incorrect
+
+## Summary
+
+The goal of `checkAfterExecution()` is to "prevent `safe` signers from removing this contract guard, changing any modules, or changing the threshold". However the way it is enforces allow for changing of threshold under certain situations and prevents certain transactions to be executed in a restrictive manner.
+
+## Vulnerability Detail
+
+The check enforces: `if (safe.getThreshold() != _getCorrectThreshold()) { revert ... }`. Which means the safe user could have changed the safe's threshold to the value returned by `_getCorrectThreshold()` after execution and the transaction would not revert.
+
+However, I believe the most note-worthy behaviour is that the safe cannot impact the value returned by `_getCorrectThreshold()` without updating its internal threshold otherwise their transaction will revert. 
+
+## Impact
+
+A multisig safe owned by a DAO will not be able to slash one of its owner for misbehaviour using the multisig because this will result in the previously valid user losing its hat, thus lowering the value of `_countValidSigners(safe.owners)` returned by `_getCorrectThreshold()` under certain threshold assumptions, making the `checkAfterExecution()` call revert.
+
+## Code Snippet
+
+Check on safe / HSG threshold: 
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L517-L519
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L533-L540
+
+## Recommendation
+
+Store the value of the underlying safe threshold locally in the before hook `checkTransaction()` and compare it in the after hook `checkAfterExecution()` if you want to enforce the safe's threshold does not change.
+
+---------------------------------------
+
+# Solo Medium: Usage of HSG for existing safe can brick safe
+
+## Summary
+
+The `HatsSignerGateFactory` allows for deployment of HSG / MHSG for existing safes. I believe the intention is to let the user call `enableModule()` and `setGuard()` on the safe after deployme with the HSG / MHSG address. 
+
+This can result in unmatching values of `maxSigners` in the HSG and number of valid signers of the safe. That will prevent further interaction with the safe rendering it unusable.
+
+## Vulnerability Detail
+
+If a safe has 10 owners with valid hats, and a HSG / MHSG is deployed with a value of `maxSigners < 10` and this HSG / MHSG is wired to the safe, the checks for `validSignerCount <= maxSigners` will revert in the HSG. 
+
+These checks are present in `reconcileSignerCount` and `claimSigner`. However `reconcileSignerCount` is a core function that is called by `checkTransaction()`, the pre-flight check on the safe transaction.
+
+## Impact
+
+The safe will not be able to execute any transaction until the number of valid signers is lowered (some hat wearers give up their hats / some hats turns invalid ...)
+
+## Code Snippet
+
+`reconcileSignerCount` checks maxSigners value:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L183-L189
+
+It is called during `checkTransaction`: 
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L464
+
+The value is set once during setup and not changeable:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L66-L84
+
+## Recommendation
+
+Allow this value to be changed by owner, or have a function that checks the HSG is safe before making it active after it is wired to an existing safe.
+
+---------------------------------------
+
+# Medium: Prevent deployment of HSG when safe has more than 5 modules
+
+## Summary
+
+I could not figure out why it is unsafe to use a gnosis safe with more than 5 enabled modules (as described in the code), but the current proxy factory will produce a HSG with wrong `enabledModuleCount` when we attempt to deploy a new HSG with an existing safe with more than 5 modules.
+
+## Vulnerability Detail
+
+If the protocol considers it unsafe to have a safe with a guard HSG with more than 5 pre-existing modules, it should restrain it. In the current implementation, it is not restrained and result in a wrong value of `enabledModuleCount`.
+
+## Impact
+
+HSG with wrong value of `enabledModuleCount` / bricked safe contracts.
+
+## Code Snippet
+
+deployHatsSignerGate only gets the existing modules with a limit of 5:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateFactory.sol#L126-L141
+
+Reference of get getModulesPaginated:
+
+https://github.com/safe-global/safe-contracts/blob/6f4355ecf38f7a842f9f173f25429def2bcbfae9/contracts/base/ModuleManager.sol#L143
+
+This is used to set the value of `enabledModuleCount` in the HSG:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L83
+
+The problem is the same for deployment of `MultiHatsSignerGate`.
+
+## Recommendation
+
+In the proxy factory, get the modules with a limit of 6 and revert if the 6th value is non-zero. Note that a user could still deploy the HSG with the correct `enabledModuleCount`, add a module to the safe, and then bind the HSG to the safe. For a definite fix you'd need to have to call a function on the HSG that checks the module count of the safe before it is active.
+
+---------------------------------------
+
+# Medium: setTargetThreshold can set target below minThreshold
+
+## Summary
+
+The `setTargetThreshold()` function can be used by owner to set the target threshold below `minThreshold` value, which is unexpected in the remainder of the contract.
+
+## Vulnerability Detail
+
+The function `setMinThreshold()` calls `_setMinThreshold()` which revert if `_minThreshold > targetThreshold`. However `setTargetThreshold()` does not enforce such constraint and can result in a value of `targetThreshold < minThreshold`.
+
+## Impact
+
+Before safe tx execution `reconcileSignerCount()` will set the safe thershold to `targetThreshold` if the number of valid signer count is above the threshold.
+
+After safe tx execution `checkAfterExecution()` will call `_getCorrectThreshold()` which will return the value of `minThreshold` if the number of valid signers is below it (which can be the case if `targetThreshold < minThreshold`). The check `if (safe.getThreshold() != _getCorrectThreshold()) { revert ... }` will then revert the execution of the transaction.
+
+Safe transactions will no longer be executable.
+
+## Code Snippet
+
+setTargetThreshold does not check for minThreshold constraints:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L95-L114
+
+Check on safe / HSG threshold: 
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L517-L519
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L533-L540
+
+## Recommendation
+
+Prevent the target threshold to be set lower than minThreshold.
+
+---------------------------------------
+
+# Medium: Fail to set safe threshold to targetThreshold
+
+## Summary
+
+There is no guarantee that the `signerCount` value of HSG is in sync with the number of valid owners of the safe when owner calls `setTargetThreshold()` to change the target threshold of the HSG. This will be the case if the owner does not call `reconcileSignerCount()` beforehand or during set up of HSG that is being wired to an underlying safe.
+
+This means the function `_setSafeThreshold()` may not be called and the value of `threshold` on the underlying safe remains higher than `targetThreshold` on the HSG.
+
+## Vulnerability Detail
+
+This problem is made worse by the behaviour of `reconcileSignerCount()` which does not update the safe threshold if `validSignerCount > targetThreshold && safe.getThreshold() > targetThresold`.
+
+## Impact
+
+The value of `threshold` on the safe may remain higher than `targetThreshold` on the HSG for a long period of time and go unnoticed to users / owner. This may result in safe tx execution failing unexpectedly.
+
+After safe tx execution `checkAfterExecution()` will call `_getCorrectThreshold()` which will return the value of `targetThreshold` if the number of valid signers is equal to or higher than `targetThreshold`. The check `if (safe.getThreshold() != _getCorrectThreshold()) { revert ... }` will then revert the execution of the transaction.
+
+I believe the impact is high as this issue is likely to arise without being caught and create confusion to users when they try to execute their transaction.
+
+## Code Snippet
+
+setTargetThreshold only sets the safe threshold if `signerCount > 1`:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L95-L103
+
+reconcileSignerCount does not update the safe threshold if `validSignerCount > targetThreshold && safe.getThreshold() > targetThresold`:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L194-L202
+
+Check on safe / HSG threshold: 
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L517-L519
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L533-L540
+
+## Recommendation
+
+Update the safe threshold under less strict conditions.
+
+---------------------------------------
+
+# Medium: _guardEntries not protecting against re-entry
+
+## Summary
+
+Safe users can forge a transaction to call `checkTransaction()` from within the safe, which will increase the value of `_guardEntries` by 1, rendering the underflow check in `checkAfterExecution()` useless.
+
+## Vulnerability Detail
+
+The safe users can forge valid data and signatures for a valid safe transaction with `currentNonce + 1`, and use this data to make a valid safe transaction with `currentNonce` that executes this data.
+
+The execution will go through `checkTransaction()` before execution, bumping `_guardEntries` to 1. It will then execute itself, entering `checkTransaction()` once again, bumping `_guardEntries` to 2.
+
+After the transaction is executed, `checkAfterExecution()` will lower `_guardEntries` back to 1 and leave it at 1.
+
+The transaction execution coming from the safe, the protective measure `if (msg.sender != address(safe)) revert NotCalledFromSafe()` is useless.
+
+## Impact
+
+The `_guardEntries` value can be bumped to `1` by safe users. I am not sure why the protocol wants to prevent re-entry using this value on these functions, but if it is important to the protocol, it should know it does not work.
+
+## Code Snippet
+
+checkTransaction bumps `_guardEntries`:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L500-L502
+
+checkAfterExecution lowers `_guardEntries` expecting to catch re-entry by having underflow errors:
+
+https://github.com/Hats-Protocol/hats-zodiac/blob/9455cc0957762f5dbbd8e62063d970199109b977/src/HatsSignerGateBase.sol#L527-L528
+
+## Recommendation
+
+Check that the value of `_guardEntries` is 1 before lowering it and revert if it is not.

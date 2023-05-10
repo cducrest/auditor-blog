@@ -1,6 +1,6 @@
 ---
 title: Olympus DAO audit result
-date: 2023-05-10
+date: 2023-05-09
 description: Results of the Olympus DAO audit on Sherlock
 defer: false
 tags:
@@ -17,68 +17,209 @@ The vault will then mint OHM tokens matching the USD value of pair tokens deposi
 The vault can deposit the LP tokens it gets from the pool and stake them to farm reward (e.g. in Aura).
 
 The code was reviewed as part of the [Sherlock contest](https://app.sherlock.xyz/audits/contests/50).
-I ranked 4th out of 154 participants in this audit. I found 1 high and 1 medium vulnerabilities, I present my findings here.
+I ranked 4th out of 154 participants in this audit. I found 3 high and 2 medium vulnerabilities, I present my findings here.
 
-# High: Abuse decreaseTotalLp for DOS
-
-## Summary
-
-The function decreaseTotalLp is called on withdraw of vaults and reverts if amount withdrawn exceeds total LP stored by the vault manager. This assumes that the withdrawn LP have been deposited by the user before, which may be wrong.
-
-A user can LP token on Balancer and reward tokens on Aura, transfer them to the vault (without using the deposit() function) and withdraw() them to break accounting. If the user lowers totalLp to 0, no other user will be able to withdraw their LP.
-
-## Vulnerability Detail
-
-withdraw() decreases totalLP on the manager:
-https://github.com/sherlock-audit/2023-03-olympus/blob/main/sherlock-olympus/src/policies/BoostedLiquidity/BLVaultLido.sol#L218
-
-The totalLP tracking assume withdrawn LP were once deposited and reverts on unexpected value:
-https://github.com/sherlock-audit/2023-03-olympus/blob/main/sherlock-olympus/src/policies/BoostedLiquidity/BLVaultManagerLido.sol#L272-L280
-
-Aura reward poolstakeFor() can be used to increase _balances[vault], allowing the vault to withdraw from aura without having deposited:
-https://github.com/aurafinance/convex-platform/blob/c17d05039f8ed5cda8fdebb72e0a17f0119521b9/contracts/contracts/BaseRewardPool.sol#L196-L227
-
-Withdraw function of Aura reward checks for _balances[msg.sender] and calls withdrawTo on Booser:
-https://github.com/aurafinance/convex-platform/blob/c17d05039f8ed5cda8fdebb72e0a17f0119521b9/contracts/contracts/BaseRewardPool.sol#L260-L285
-
-Withdraw function of Booster (called by withdrawTo) burns the pool token, which could have been transferred by the user:
-https://github.com/aurafinance/convex-platform/blob/c17d05039f8ed5cda8fdebb72e0a17f0119521b9/contracts/contracts/Booster.sol#L483-L509
-
-The rest of the wihtdraw() function of BLVaultLido will run smoothly without specific care from the attacker, it exits the balancer pool using the LP token received from Aura and repays the wstETH / OHM.
-
-## Impact
-
-Users can break the tracking of totalLp in the vault manager, preventing other users to withdraw.
-
-The cost of the attack to the user is limited, they mint LP tokens, stake them, and eventually get wstETH back. They lose 50% of the value of the withdraw since they receive only the wstETH and not the OHM (which they had to LP). However, it is sufficient that a user perform this attack with a value of 1 with negligible costs to break accounting.
-
-## Recommendation
-
-Add tracking of deposits and withdraw within user vaults so that they can only withdraw what they deposited.
-
----------------------------------------
-
-# Medium: SetLimit does not take into account burned OHM
+# High: cachedUserRewards is never cleaned
 
 ## Summary
 
-The function setLimit() may not be able to sufficiently restrict mint ability of manager.
+The system uses `cachedUserRewards` as a cache of the amount of reward tokens a user was entitled to but did not withdraw. However, this value is never reset to 0 so a user with cached reward will receive these rewards on withdraws when a userRewardDebts is reset to 0.
 
 ## Vulnerability Detail
 
-The setLimit() function reverts when newLimit_ < deployedOhm, mintOhmToVault will revert if deployedOhm + amount_ > ohmLimit + circulatingOhmBurned. If the value of circulatingOhmBurned is high, and the admin can only set the limit above deployedOhm, they could end up in a state where they cannot limit the amount the vault is allowed to burn sufficiently. I.e. the vault is always able to mint at least circulatingOhmBurned new tokens.
+In `_withdrawUpdateRewardState`, if `claim_ == false`, the value of `userRewardDebts` for the user will not be updated and the check `rewardDebtDiff > userRewardDebts[msg.sender][rewardToken.token]` may pass (line 583). This will set the `userRewardDebts` to 0 and increase `cachedUserRewards` by its difference to `rewardDebtDiff`. 
 
-Note that circulatingOhmBurned is never lowered (even when minting new tokens), so this value could grow arbitrarily high.
+On the next withdraw, the user will be entitled to receive its pending rewards as well as the cached reward based on the value of `cachedUserRewards`. The value of `cachedUserRewards` is not lowered afterwhile, that is not a problem in itself because `userRewardDebts` will be increased anyway by the amount of reward token sent, so it will take into account the cached value.
+
+However, if the user repeats the operation multiple times, the value of `cachedUserRewards` will keep on growing and never lowers. After two times accruing cached rewards, and after the userRewardDebts is reset to 0 (line 584), the user will be able to claim rewards using `claimRewards()` and receive reward equal to the amount of token cached both the first and the second time.
+
+Example:
+
+- Users deposits pair tokens
+- They are entitled to a reward
+- They withdraw 10% of their deposit with `claim_ = false`
+- This increases `cachedUserRewards` by 10% of their entitled reward
+- They call `claimRewards()`, claiming all their rewards and adding the reward debt to `userRewardDebts`
+- They wait for reward to accrue
+- They withdraw 20% of their deposit with `claim_ = false` 
+- Their `userRewardDebts` is reset to 0
+- Their `cachedUserRewards` is increased by 20% of their entitled reward on top of the previous 10%
+- They call `claimRewards()`, claiming all their pending rewards + cached rewards of 20% + cached rewards of 10%
+
+They received the initial 10% cached rewards twice.
 
 ## Impact
 
-Lack of control of admin on mint ability of manager.
+Attackers can drain reward tokens from the contract.
 
 ## Code Snippet
 
-SetLimit function:
-https://github.com/sherlock-audit/2023-03-olympus/blob/main/sherlock-olympus/src/policies/BoostedLiquidity/BLVaultManagerLido.sol#L480-L483
+cachedUserRewards is increased but never lowered:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L583-L590
+
+cachedUserRewards are used in the calculation for amount of reward token the user is entitled to:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L354-L372
 
 ## Recommendation
 
-Use similar restrictions as in mintOhmToVault() for setLimit or lower circulatingOhmBurned when minting new OHM.
+Reset the value of `cachedUserRewards` on withdraw instead of adding it to the `userRewardDebts` value. 
+
+---------------------------------------
+
+# High: Incorrect reward tracking / calculation
+
+## Summary
+
+The function that calculates the amount of reward token to receive `internalRewardsForToken()` divides the end result by `10**18` which is inconsistent with how the result is treated.
+
+## Vulnerability Detail
+
+The result returned by `internalRewardsForToken()` is `(cachedUserRewards[user_][rewardToken.token] + (lpPositions[user_] * accumulatedRewardsPerShare) - userRewardDebts[user_][rewardToken.token]) / 1e18`. The lp token uses 18 decimals and `accumulatedRewardsPerShare` is expressed in power of 18 as suggested by `accumulatedRewardsPerShare += (totalRewards * 1e18) / totalLP`.
+
+This result is used by `_claimInternalRewards` which adds it to `userRewardDebts[msg.sender][rewardToken]`. The values of `userRewardDebts` and `cachedUserRewards` are then transferred from one to the other in `_withdrawUpdateRewardState` under certain circumstances (line 585), which means they should have the same dimension (in terms of power of 10).
+
+However, as we saw the value of `cachedUserRewards` for the user is divided by `1e18` in the calculation above, which means they cannot have the same dimension.
+
+Additionally the amount of tokens transferred by `_claimInternalRewards()` should take into account the full cache and not `cachedUserRewards / 1e18`
+
+## Impact
+
+The cached user reward have almost no impact on the reward token that should be withdrawn by the user. The users will receive less reward token than they should if they use the cache and do not withdraw their rewards on each withdraw from the vault.
+
+## Code Snippet
+
+internalRewardsForToken divides the whole result by `10**18`:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L354-L372
+
+It is used in _claimInternalRewards:
+
+ https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L623-L634
+
+cachedUserRewards and userRewardDebts should be comparable:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L583-L590
+
+## Recommendation
+
+Move the division by 10**18.
+
+```diff 
+    function internalRewardsForToken(uint256 id_, address user_) public view returns (uint256) {
+        InternalRewardToken memory rewardToken = internalRewardTokens[id_];
+        uint256 lastRewardTime = rewardToken.lastRewardTime;
+        uint256 accumulatedRewardsPerShare = rewardToken.accumulatedRewardsPerShare;
+
+        if (block.timestamp > lastRewardTime && totalLP != 0) {
+            uint256 timeDiff = block.timestamp - lastRewardTime;
+            uint256 totalRewards = timeDiff * rewardToken.rewardsPerSecond;
+
+            // This correctly uses 1e18 because the LP tokens of all major DEXs have 18 decimals
+            accumulatedRewardsPerShare += (totalRewards * 1e18) / totalLP;
+        }
+
+        // This correctly uses 1e18 because the LP tokens of all major DEXs have 18 decimals
++        uint256 totalAccumulatedRewards = (lpPositions[user_] * accumulatedRewardsPerShare)  / 1e18 -
++            userRewardDebts[user_][rewardToken.token];
++
++        return cachedUserRewards[user_][rewardToken.token] + totalAccumulatedRewards
+
+-        uint256 totalAccumulatedRewards = (lpPositions[user_] * accumulatedRewardsPerShare) -
+-            userRewardDebts[user_][rewardToken.token];
+-
+-        return (cachedUserRewards[user_][rewardToken.token] + totalAccumulatedRewards) / 1e18;
+```
+
+---------------------------------------
+
+# High: Pool withdraw vulnerable to flash loan
+
+## Summary
+
+The function from `WstethLiquidityVault` to withdraw from the pool will exit the the Balancer pool and get OHM / wstETH in proportion to the current pool balances. If the withdrawer flash loans from the pool before, they can impact the proportion of OHM / wstETH received. 
+
+## Vulnerability Detail
+
+As the `withdraw()` function from `SingleSidedLiquidityVault` will repay (burn) the OHM token to the protocol and only send the pair token (wstETH) to the user, the user is incentivized to flash loan OHM from the pool so he receives more pair token (wstETH).
+
+## Impact
+
+This attack vector is limited by the `_isPoolSafe()` function called at the beginning of `withdraw()` which checks that the on-chain pool price is not more than `THRESHOLD` away from the oracle price. Depending on the value of `THRESHOLD`, the impact is more or less severe. If `THRESHOLD` represents 1%, then the user will be able to get 1% more tokens out of the withdraw than they should.
+
+An attacker could repeatedly deposit / flash loan / withdraw / reimburse flash loan to make a profit until the price of the pool becomes naturally too far from the oracle price. The attacker can then sell their gained pair tokens which could impact the oracle price to lower the price of pair token and attack again.
+
+## Code Snippet
+
+`_withdraw` in `WstethLiquidityVault`
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/WstethLiquidityVault.sol#L179
+
+`withdraw()` in `SingleSidedLiquidityVault`, calls `_isPoolSafe()` and `_withdraw()`, then pays out only pairToken
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L252-L285
+
+`_isPoolSafe()` uses oracle and threshold:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L411-L421
+
+## Recommendation
+
+Use `_valueCollateral()` to withdraw from the pool in a 50/50 usd value split based on oracle price and send out pair token to withdrawer instead of relying on pool balances.
+
+---------------------------------------
+
+# Medium: removeInternalRewardToken does not clean storage value for users
+
+## Summary
+
+The function `removeInternalRewardToken()` deletes an internal reward token from the list of reward tokens. However the values of `userRewardDebts` and `cachedUserRewards` for the token are still kept in storage.
+
+## Vulnerability Detail
+
+If the token is added once again in the future, we could easily have inconsistencies with the leftover storage values concerning the users. As an example if the token is added again it will have `accumulatedRewardsPerShare == 0` while some users might have `userRewardDebts` set to a high value. These users may not be able to accumulate rewards in the future for this token.
+
+## Impact
+
+If reward tokens are added / removed / added again, accounting will most likely be broken for some users. This is a problem even if the protocol does not intend to add / remove / add tokens if they unintentionally remove the wrong reward token from a vault, there will be no way for recovery.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L674-L703
+
+## Recommendation
+
+Let the function `addInternalRewardToken` to provide a value for `accumulatedRewardsPerShare` or loop through user data and delete it (should be fine gas-wise because it's cleaning storage so getting gas refunded).
+
+---------------------------------------
+
+# Medium: Adding reward token with future timestamp may break vault
+
+## Summary
+
+The vault has the possibility to add internal reward token with a timestamp in the future. Doing so will make accumulation of internal rewards fail due to underflow.
+
+## Vulnerability Detail
+
+The function to accumulate internal rewards calculates `uint256 timeDiff = block.timestamp - rewardToken.lastRewardTime;` which will revert if `rewardToken.lastRewardTime` is in the future.
+
+This function is called in `_depositUpdateRewardState()` which is called among the first steps of `deposit()` and in `_withdrawUpdateRewardState` called among the first steps of `withdraw()`. 
+
+## Impact
+
+Adding an internal token with a timestamp in the future will lock the vault until that timestamp is reached or the reward token is removed.
+
+## Code Snippet
+
+addInternalRewardToken allows lastRewardTime to be in the future:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L674-L688
+
+underflow in _accumulateInternalRewards:
+
+https://github.com/sherlock-audit/2023-02-olympus/blob/main/src/policies/lending/abstracts/SingleSidedLiquidityVault.sol#L472
+
+## Recommendation
+
+Check for future timestamp and assign a reward of 0.
