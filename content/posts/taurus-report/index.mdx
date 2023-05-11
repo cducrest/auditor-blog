@@ -1,0 +1,263 @@
+---
+title: Taurus audit result
+date: 2023-05-11
+description: Results of the Taurus audit on Sherlock
+defer: false
+tags:
+  - Audit result
+  - Sherlock
+  - Contested issues
+banner: ./taurus.jpg
+---
+
+![taurus](./taurus.jpg)
+
+Taurus is a stable coin protocol using self-repaying loans. Borrower use interest-bearing collateral to loan $TAU. 
+The interests accrued by the collateral is used to repay the loan of the borrower.
+The loans are over-collateralized, the value of $TAU borrowed is lower than the value of the locked collateral.
+
+The idea behind the dollar-peg of $TAU is that if $TAU is worth less than a dollar users are disincentivized to mint $TAU via borrowing since
+they'll receive less than their collateral is worth. Borrowers are also incentivzed to repay their loans since they can buy $TAU for cheaper to repay their loans.
+If $TAU is worth more than a dollar, users are incentivized to open new loans since they'll receive high-value $TAU, they also are disincentivized to repay their loans since
+they would spend high value $TAU.
+
+The code was reviewed as part of the [Sherlock contest](https://app.sherlock.xyz/audits/contests/45).
+I ranked 2nd out of 159 participants in this audit. I found 2 high and 1 medium vulnerabilities. 
+I also found an additional high and medium vulnerabilities that were not accepted as valid by the judges and protocol team. 
+I believe these to still be issues and should check if they are still present when the protocol is released.
+I present my findings here.
+
+# High: Protocol assumes 18 decimals collateral
+
+## Summary
+
+Multiple calculation are done with the amount of collateral token that assume the collateral token has 18 decimals. Currently the only handled collateral (staked GLP) uses 18 decimals. However, if other tokens are added in the future, the protocol may be broken.
+
+## Vulnerability Detail
+
+TauMath.sol calculates the collateral ratio (coll * price / debt) as such:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Libs/TauMath.sol#L18
+
+It accounts for the price decimals, and the debt decimals (TAU is 18 decimals) by multiplying by Constants.precision (`1e18`) and dividing by `10**priceDecimals`. The result is a number with decimal precision corresponding to the decimals of `_coll`.
+
+This `collRatio` is later used and compared to values such as `MIN_COL_RATIO`, `MAX_LIQ_COLL_RATIO`, `LIQUIDATION_SURCHARGE`, or `MAX_LIQ_DISCOUNT` which are all expressed in `1e18`.
+
+Secondly, in `TauDripFeed` the extra reward is calculated as:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/TauDripFeed.sol#L91
+
+This once again assumes 18 decimals for the collateral. This error is cancelled out when the vault calculates the user reward with:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L90
+
+However, if the number of decimals for the collateral is higher than 18 decimals, the rounding of `_extraRewardPerCollateral` may bring the rewards for users to 0.
+
+For example: `_tokensToDisburse = 100 e18`, `_currentCollateral = 1_000_000 e33`, then `_extraRewardPerCollateral = 0` and no reward will be distributed.
+
+## Impact
+
+Collateral ratio cannot be properly computed (or used) if the collateral token does not use 18 decimals. If it uses more decimals, users will appear way more collateralised than they are. If it uses less decimals, users will appear way less collateralised. The result is that users will be able to withdraw way more TAU than normally able or they will be in a liquidatable position before they should.
+
+It may be impossible to distribute rewards if collateral token uses more than 18 decimals.
+
+## Code Snippet
+
+Constants.precision is `1e18`:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Libs/Constants.sol#L24
+
+MIN_COL_RATIO is expressed in 1e18:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L57
+
+TauDripFeed uses `1e18` once again in calculation with collateral amount:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/TauDripFeed.sol#L91
+
+The calculation for maxRepay is also impacted:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L251-L253
+
+The calculation for expected liquidation collateral is also impacted:
+
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L367
+
+## Recommendation
+
+Account for the collateral decimals in the calculation instead of using `Constants.PRECISION`.
+
+---------------------------------------
+
+# High: Keepers can clean off debts
+
+## Summary
+
+The documentation for the protocol states that keepers are "trusted with vault yield but not user collateral. They generally perform upkeep on the vault such as swapping yield for Tau and running the LiquidationBot." However, they can abuse the `SwapHandler.swapForTau()` function to clean off the debt of every user of the protocol. With that, they can mint any amount of TAU they like and break the protocol.
+
+## Vulnerability Detail
+
+`swapForTau` can only be called by the keepers. It uses an input argument `_rewardProportion` to determine the portion of swapped TAU used to repay the users debt via `TauDripFeed._withholdTau()`. A value of `_rewardProportion = 1e18` means all the TAU swapped will be used to repay user debts.
+
+However, there is no limit to the value provided by the keeper. Additionally, the accounting for reward is decorrelated to the actual balance of TAU received by the SwapHandler. As a result, the keeper can submit `_rewardProportion = 1e70` (or any arbitrary value) to use `1e52 * amount of TAU received` to repay debts, which should completely clean of all the debts in the vault.
+
+## Impact
+
+Keeper has the power to break the protocol (clean off all the debt). They can open a position to withdraw as many TAU as they can, clean off their debts, and start again to mint as many TAU as they want.
+
+Keeper has more power than the documentation claim they have.
+
+## Code Snippet
+
+`_rewardProportion` provided by keeper in `swapForTau()`:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/SwapHandler.sol#L45-L52
+
+`_withholdTau` called with `tauReturned * _rewardProportion`:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/SwapHandler.sol#L91
+
+`_withholdTau` increases tauWithheld, which is later used to repay user debts:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/TauDripFeed.sol#L106-L110
+
+## Recommendation
+
+Limit the provided value of `_rewardProportion` by `1e18`.
+
+---------------------------------------
+
+# Medium: TAU burnFrom lowers wrong currentMinted value
+
+## Summary
+
+The TAU contract lowers the `currentMinted` using the `currentMinted` value of the wrong address when using `burnFrom`. It uses the address of the account we withdraw the token from while it should use `msg.sender`. It should consider that `msg.sender` withdraws the token from `account` and `msg.sender` then burns the token.
+
+This lead to wrong accounting of `currentMinted` for vaults which will escalate into bigger accounting error over time and inevitably lead to reaching the mint limit set by `TAU.sol` prematurely.
+
+## Vulnerability Detail
+
+The TAU token contract has limits set for each vault for the maximum amount of TAU that can be minted by the vault. This limit is set by the governance address.
+
+When a vault mints token, the tracked amount of TAU minted by the vault is increased and the mint reverts if the amount exceeds the vault's limit. When a vault burns token using `burn()`, `currentMinted[vault]` decreases by the burned amount. However when a vault calls `burnFrom(user, amount)` the value of `currentMinted[user]` is wrongly used in the computation of the resulting `currentMinted` value.
+
+`burnFrom()` is used when a user repays its debt, when a liquidator repays the debt of another user's position, or when the `TauDripFeed` receives TAU rewards from an external source and uses this reward to repay user debt. It is clear that in these situations the amount of TAU the vault is responsible for minting should be lowered and not the amount of TAU minted by the user / liquidator / reward sender.
+
+## Impact
+
+When users open position with a debt of x and immediately close it, the value of `currentMinted[vault]` will be increased by x and never lowered. After a number of these operations, the `currentMinted[vault]` will reach `mintLimit[vault]` defined by governance in TAU and the vault will no longer be able to mint TAU for new positions. i.e. the vault cannot create new debt.
+
+Any user can abuse this system any number of times with low costs (only gas costs) to DOS a vault until governance sets the `mintLimit[vault]` to a value that cannot be reached, disabling this security.
+
+## Code Snippet
+
+burnFrom uses `currentMinted[account]` accountMinted value (L79):
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/TAU.sol#L71-L83
+
+the currentMinted is continuously increased in `mint` and reverts upon reaching limit:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/TAU.sol#L35-L47
+
+burnFrom used in distributeRewards:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/TauDripFeed.sol#L51-L53
+
+burnFrom used to repay debts / liquidate in baseVault:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L300
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L376
+
+## Recommendation
+
+Use `msg.sender` to decrease account minted in burnFrom:
+
+```diff
+    function burnFrom(address account, uint256 amount) public virtual override {
+        super.burnFrom(account, amount);
+-       _decreaseCurrentMinted(account, amount);
++       _decreaseCurrentMinted(msg.sender, amount);
+    }
+```
+
+Or use msg.sender in `_decreaseCurrentMinted`:
+
+```diff
+    function _decreaseCurrentMinted(address account, uint256 amount) internal virtual {
+        // If the burner is a vault, subtract burnt TAU from its currentMinted.
+        // This has a few highly unimportant edge cases which can generally be rectified by increasing the relevant vault's mintLimit.
+-       uint256 accountMinted = currentMinted[account];
++       uint256 accountMinted = currentMinted[msg.sender];
+        if (accountMinted >= amount) {
+            currentMinted[msg.sender] = accountMinted - amount;
+        }
+    }
+```
+
+---------------------------------------
+
+# Contested High: Liquidator burns more TAU than repaid debt
+
+## Summary
+
+When a liquidator calls `liquidate()` and the whole collateral for the user is to be liquidated, the user may burn more TAU than he receives collateral (proportional to price) due to truncated `collateralToLiquidate` value.
+
+## Vulnerability Detail
+
+In `_calcLiquidation`, if the calculated collateral to liquidate is greater than the collateral available in the user position, the value of collateral liquidated is truncated:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L408-L410
+
+This truncated returned value is later used to lower the collateral of the user:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L359-L376
+
+However, as we can see, there is no adjustments made to the `_debtAmount` withdrawn from the user's position and burned from the liquidator.
+
+If the collateral ratio of the position is smaller than 1, the total collateral of a user should be liquidatable for a lower price than its debt. I.e. after optimal liquidation, there should be some debt and no collateral remaining. If `liquidate` is called with a `debtAmount` covering the total user debt, the liquidator will pay the full `debtAmount` and receive only `collateral * price < debtAmount` worth of collateral back.
+
+## Impact
+
+This impact is partially mitigated by `_minExchangeRate` parameter of the `liquidate()` function that reverts liquidation when received collateral is below expected value:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/BaseVault.sol#L367-L369
+
+However, this parameter may not be used by external liquidators and is unused by the liquidation bot:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/LiquidationBot/LiquidationBot.sol#L100
+
+External users should not want to trigger liquidation if collateral ratio is greater than 1. If they trigger liquidation when the collateral ratio is lower than 1 and do not use the `_minExchangeRate` parameter, liquidator will pay out some part of debt without receiving collateral.
+
+Liquidation bot will likely burn more TAU than needed.
+
+## Recommendation
+
+Truncate the amount of debt paid out to match the value of collateral received.
+
+---------------------------------------
+
+# Contested Medium: Accounting error for TAU currentMinted
+
+## Summary
+
+Due to accounting error in minted / burned TAU for vaults, it could be that a vault has more total debt than `TAU.currentMinted[vault]`, which will escalate into more accounting errors over time and may lead to reaching the mint limit set by `TAU.sol` prematurely.
+
+## Vulnerability Detail
+
+The TAU token contract has limits set for each vault for the maximum amount of TAU that can be minted by the vault. This limit is set by the governance address.
+
+When a vault mints token, the tracked amount of TAU minted by the vault is increased and the mint reverts if the amount exceeds the vault's limit. When a vault burns token using `burn()`, `currentMinted[vault]` decreases by the burned amount if it is not bigger than the current minted amount for the vault.
+
+The `SwapHandler.swapForTau()` function swaps yield received for TAU, burns the TAU (so decreases currentMinted[vault]) and rewards users by repaying their debt for a portion of the burned TAU based on the `_rewardProportion` value. Since only a portion of the burnt TAU repays debt, the total outstanding debt of the vault is higher than `currentMinted[vault]`.
+
+If users repay their debts, we will reach a moment where `currentMinted[vault]` is lower than the amount of debt repaid by a user. At this point the `currentMinted[vault]` will not be lowered by the amount of TAU burnt in the debt repayment.
+
+As result the `currentMinted[vault]` value can be higher than the value the vault actually minted.
+
+This issue can be repeated multiple times to further decorrelate the `currentMinted[vault]` value from its correct value. The issue amplifies itself as the more wrong this value is, the more likely it is that user repaid debt exceeds `currentMinted[vault]`.
+
+## Impact
+
+Accounting of `currentMinted[vault]` is not properly done and may bring vaults to reach the mint limit faster than planned, preventing them from minting TAU further (opening user positions with debt).
+
+## Code Snippet
+
+TAU mint function increase current minted and reverts above limit:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/TAU.sol#L35-L47
+
+TAU burn function decreases current minted:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/TAU.sol#L54-L58
+
+swapForTau burns an amount of TAU but only repays part of it towards user debt:
+https://github.com/sherlock-audit/2023-03-taurus/blob/main/taurus-contracts/contracts/Vault/SwapHandler.sol#L87-L91
+
+## Recommendation
+
+Allow `currentMinted` to go negative e.g. by using an additional storage value `currentMintedDebt` that will be increased when an amount of token is burnt that is above `currentMinted[vault]` and used to lower `currentMinted[vault]` when minting new tokens.
