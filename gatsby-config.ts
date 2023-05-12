@@ -32,6 +32,10 @@ const config: GatsbyConfig = {
             title: `About`,
             slug: `/about`,
           },
+          {
+            title: `References`,
+            slug: `/knowledge-references`,
+          },
         ],
         externalLinks: [
           {
