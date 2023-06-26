@@ -14,12 +14,60 @@ I store them here to be used when reporting issues for future contests.
 
 - Requiring slippage protection on oracle price changes: https://github.com/sherlock-audit/2023-03-olympus-judging/issues/3
 
+- Accounting of unused value wrong: https://github.com/sherlock-audit/2023-02-blueberry-judging/issues/137
+
+- Bugs outside of scope impacting in-scope contracts: https://github.com/sherlock-audit/2023-03-teller-judging/issues/328#issuecomment-1582380098
+
 ### Change of severity due to different exploit
 
-- An issue was de-duplicated and changed severity due to different understanding of the exploit: https://github.com/sherlock-audit/2023-02-hats-judging/issues/41
+- An issue was de-duplicated and changed severity due to different understanding of the exploit: https://github.com/sherlock-audit/2023-02-hats-judging/issues/41,
+https://github.com/sherlock-audit/2023-03-teller-judging/issues/26
 
-## vulnerabilities
+### Issues rejected when they should be valid
+
+- Bug in contracts in scope that impact out of scope contract: https://github.com/sherlock-audit/2023-03-teller-judging/issues/119#issuecomment-1580157742
+
+## Vulnerabilities
 
 - Chainlink oracle check for outdated data: https://github.com/sherlock-audit/2023-04-blueberry-judging/issues/43 and https://github.com/sherlock-audit/2023-02-blueberry-judging/issues/94
 
+- Balancer's read-only reentrancy: https://github.com/sherlock-audit/2023-04-blueberry-judging/issues/141
+
+- External calls to untrusted contracts can use more than 63/64th of the block gas limit to prevent correct execution of remainder of transaction 
+if it requires more than 1/64th of the block gas limit. ([see thread](https://twitter.com/0xOwenThurm/status/1618417556683108352))
+
+- The `s` value of a `(v, r, s)` signature can be manipulated to make a signature that recovers to the same address if the range of s is not checked 
+([see OpenZeppelin](https://github.com/OpenZeppelin/openzeppelin-contracts/blob/1642b6639b93e3b97be163d49827e1f56b81ca11/contracts/utils/cryptography/ECDSA.sol#L124)).
+The signature can be used to recover a different message for a different public key.
+
+- attempting to transfer zero token with ERC20 https://github.com/sherlock-audit/2023-03-teller-judging/issues/177
+
+- abuse the fact that ERC721 token recipients needs to implement `onERC721Received()` to receive tokens
+
+- Compound's comptroller `enterMarket` and `exitMarket` do not revert on error: https://consensys.net/diligence/audits/2021/03/defi-saver/#error-codes-of-compounds-comptrollerentermarket-comptrollerexitmarket-are-not-checked
+
+## Weird tokens
+
+- USDT can introduce fee-on-transfer: https://etherscan.io/token/0xdac17f958d2ee523a2206206994597c13d831ec7#code
+- YAMv2 has 24 decimals: https://etherscan.io/token/0xaba8cac6866b83ae4eec97dd07ed254282f6ad8a
+- Some ERC20 have two addresses (never found one)
+
+## Vulnerability categories to remember
+
+When auditing a protocol remember to check for:
+
+- Price Oracle Manipulation
+- Erroneous Accounting
+- ID Uniqueness Violations
+- Inconsistent State Updates
+- Privilege Escalation
+- Atomicity Violations
+- Use of safeTransfer for ERC20
+- Fee-on-transfer / rebase token
+- Blacklist tokens
+- Front/back-running transactions
+- Signature malleability
+- Parallel data structures
+- Asymetrical code
+- Use of unsafe delete
 
