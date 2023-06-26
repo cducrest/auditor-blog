@@ -1,0 +1,753 @@
+---
+title: Teller audit result
+date: 2023-06-26
+description: Results of the Teller audit on Sherlock
+defer: false
+tags:
+  - Audit result
+  - Sherlock
+banner: ./teller.jpg
+---
+
+![teller](./teller.jpg)
+
+Teller is a borrowing / lending protocol allowing lender to enter markets and accept borrower bids for loans. The loans can be collateralized with ERC20 and ERC721 tokens.
+Interests are accrued in the principal of the loan and repayment schedule of the loan is defined by the market parameters while value and duration of the 
+loans are defined by the borrowers.
+
+The code was reviewed as part of the [Sherlock contest](https://app.sherlock.xyz/audits/contests/62).
+I ranked 2nd out of 230 participants in this audit. I found 4 high and 8 medium vulnerabilities.
+I present my findings here.
+
+# High: Missing access control in setCollateralEscrowBeacon
+
+## Summary
+
+The function to set the reference implementation of the escrow inside of `CollateralManager` has no access control. It can be used by an attack to set its own implementation as a reference.
+
+The attacker could use an escrow where they are allowed to withdraw the collateral. They can use the `LenderCommitmentForwarder` to automatically make a bid with collateral and accept it. They can then withdraw their collateral and never repay the loan. They can repeat the operation until `LenderCommitmentForwarder` is drained out of funds.
+
+## Vulnerability Detail
+
+`TellerV2` and `CollateralManager` expose re-initializer functions. I believe the goal of these functions is to set values that were not present in the past versions of the contracts after an upgrade:
+
+```solidity
+    function setLenderManager(address _lenderManager)
+        external
+        reinitializer(8)
+        onlyOwner
+    {
+        _setLenderManager(_lenderManager);
+    }
+```
+
+```solidity
+    function setCollateralEscrowBeacon(address _collateralEscrowBeacon)
+        external
+        reinitializer(2)
+    {
+        collateralEscrowBeacon = _collateralEscrowBeacon;
+    }
+```
+
+As we can see, `setLenderManager` uses the `onlyOwner` modifier and `setCollateralEscrowBeacon` has no protection.
+
+`setCollateralEscrowBeacon` can be called by an attacker during upgrades of the protocol before the protocol team has the time to call it (or as a front-run tx).
+
+If the re-initializer function has not been called at all by the protocol team, the problem can be even longer-lived. As the value of `collateralEscrowBeacon` is already set in `initialize()`, it could be that the re-initializer has never been called for some instances of the contract and is free to be abused:
+
+```solidity
+    function initialize(address _collateralEscrowBeacon, address _tellerV2)
+        external
+        initializer
+    {
+        collateralEscrowBeacon = _collateralEscrowBeacon;
+        tellerV2 = ITellerV2(_tellerV2);
+        __Ownable_init_unchained();
+    }
+```
+
+## Impact
+
+Usually front-running initializer is not an important problem as the protocol team can simply re-deploy (or in this case re-upgrade) to fix / avoid the problem. 
+
+However in this case, the upgrade impacts a live ecosystem with value at stake.
+
+As explained in the summary, the attacker can use a beacon with a reference implementation that allows them to withdraw the collateral at all times.
+
+If a lender accepts a loan with collateral at that time, the attacker will be allowed to withdraw the collateral of the user, resulting in a loss of funds for both borrower and lender (borrower lost collateral and won't repay loan to lender).
+
+The loan acceptance process is automated in `LenderCommitmentForwarder` and the attacker can simply open a loan through it, withdraw the collateral, and repeat the operation until no funds are left in the `LenderCommitmentForwarder`.
+
+## Code Snippet
+
+LenderCommitmentForwarder automated loan opening feature:
+
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/LenderCommitmentForwarder.sol#L300-L400
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Add access control to `setCollateralEscrowBeacon`
+
+---------------------------------------
+
+# High: _repayLoan will fail if lender is blacklisted
+
+## Summary
+
+The internal function that repays a loan `_repayLoan` attempts to transfer the loan token back to the lender. If the loan token implements a blacklist like the common USDC token, the transfer may be impossible and the repayment will fail.
+
+This internal `_repayLoan` function is called during any partial / full repayment and during liquidation.
+
+## Vulnerability Detail
+
+The function to repay the loan to the lender directly transfers the token to the lender:
+
+```solidity
+    function _repayLoan(...) internal virtual {
+        ...
+        bid.loanDetails.lendingToken.safeTransferFrom(
+            _msgSenderForMarket(bid.marketplaceId),
+            lender,
+            paymentAmount
+        );
+        ...
+```
+
+This function is called by any function that attemps to repay a loan (including liquidate):
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L593
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L615
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L649
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L690
+
+Any of these functions will fail if loan lender is blacklisted by the token. 
+
+During repayment the loan lender is computed by:
+```solidity
+    function getLoanLender(uint256 _bidId)
+        public
+        view
+        returns (address lender_)
+    {
+        lender_ = bids[_bidId].lender;
+
+        if (lender_ == address(lenderManager)) {
+            return lenderManager.ownerOf(_bidId);
+        }
+    }
+```
+
+If the lender controls a blacklisted address, they can use the lenderManager to selectively transfer the loan to / from the blacklisted whenever they want.
+
+## Impact
+
+Any lender can prevent repayment of a loan and its liquidation. In particular, a lender can wait until a loan is almost completely repaid, transfer the loan to a blacklisted address (even one they do not control) to prevent the loan to be fully repaid / liquidated. The loan will default and borrower will not be able to withdraw their collateral.
+
+This result in a guaranteed griefing attack on the collateral of a user.
+
+If the lender controls a blacklisted address, they can additionally withdraw the collateral of the user.
+
+I believe the impact is high since the griefing attack is always possible whenever lent token uses a blacklist, and results in a guaranteed loss of collateral.
+
+## Code Snippet
+
+The function to withdraw collateral only works when loan is paid or transfer to lender when loan is defaulted:
+
+```solidity
+    function withdraw(uint256 _bidId) external {
+        BidState bidState = tellerV2.getBidState(_bidId);
+        if (bidState == BidState.PAID) {
+            _withdraw(_bidId, tellerV2.getLoanBorrower(_bidId));
+        } else if (tellerV2.isLoanDefaulted(_bidId)) {
+            _withdraw(_bidId, tellerV2.getLoanLender(_bidId));
+            emit CollateralClaimed(_bidId);
+        } else {
+            revert("collateral cannot be withdrawn");
+        }
+    }
+```
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Use a push/pull pattern for transferring tokens. Allow repayment of loan and withdraw the tokens of the user into `TellerV2` (or an escrow) and allow lender to withdraw the repayment from `TellerV2` (or the escrow). This way, the repayment will fail only if `TellerV2` is blacklisted.
+
+---------------------------------------
+
+# High: Anyone can commit collateral for someone else
+
+## Summary
+
+There is no access control on `CollateralManager.commitCollateral()`. It takes as input the bid ID and the collateral info and commits the borrower of bid ID to the input collateral.
+
+Anyone can call this function to commit any amount of any collateral for any bid ID.
+
+When the loan is accepted, the committed to collateral will be taken from the user and used as collateral in an escrow.
+
+## Vulnerability Detail
+
+No access control on `commitCollateral()`:
+```solidity
+    function commitCollateral(
+        uint256 _bidId,
+        Collateral[] calldata _collateralInfo
+    ) public returns (bool validation_) {
+        address borrower = tellerV2.getLoanBorrower(_bidId);
+        (validation_, ) = checkBalances(borrower, _collateralInfo);
+
+        if (validation_) {
+            for (uint256 i; i < _collateralInfo.length; i++) {
+                Collateral memory info = _collateralInfo[i];
+                _commitCollateral(_bidId, info);
+            }
+        }
+    }
+```
+There is no access control on any of the called functions down the call chain:
+
+No access control on `checkBalances()` called by `commitCollateral()`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L168-L173
+
+No access control on `_checkBalances()`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L450-L470
+
+No access control on `_checkBalance()`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L478-L504
+
+No access control on `_commitCollateral()`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L426-L442
+
+## Impact
+
+It is necessary that the borrower of the attacked `bidId` called approve for the committed to tokens for them to be used as collateral when the lender approves the bid. 
+
+As a result, an attacker can prevent the bid to ever be successfully accepted by committing the bid to a collateral (or a value) that is not approved by the borrower.
+
+It is a common pattern that user approves contracts they trust with the max value (`type(uint256).max`) even though they will only spend parts of their token. A user holding 100 USDC that wants to commit 50 USDC for a bid can be attacked (by evil lender or anyone else) to commit the full 100 USDC and have all their tokens held as collateral when the bid is accepted.
+
+Even when user do not use `type(uint256).max` to approve the contract, if they approved 100 USDC but intend to commit 50 USDC for a certain bid and 50 USDC for another bid, they are vulnerable to the attack.
+
+The result is a possible DOS attack on any loan, and a risk of funds for the borrowers.
+
+## Code Snippet
+
+The function that withdraw collateral from user and puts it in escrow, called when loan is accepted:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L179-L199
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Only allow bid borrower or `TellerV2` to call `commitCollateral()`.
+Please not that there are two `commitCollateral()` functions impacted, one for committing an array of collateral and one for committing a single collateral.
+
+---------------------------------------
+
+# High: Borrower can front-run lender's acceptBid to lower/remove its collateral
+
+## Summary
+
+The function `TellerV2.submitBid()` to submit a bid with collateral does not withdraw a borrower's collateral. It only commits to the values via `collateralManager.commitCollateral()`.
+
+When the lender calls `lenderAcceptBid`, the borrower can front-run the transaction and call `collateralManager.commitCollateral()` to commit to the previously committed to collateral with an amount of 0.
+
+The lender will accept the bid but the escrow will be deployed with 0 collateral amount.
+
+## Vulnerability Detail
+
+The function `submitBid()` with collateral calls `collateralManager.commitCollateral()`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L323-L326
+
+`commitCollateral()` checks the user balances (i.e. the user owns the amount of committed token) and writes to storage the commitment, it does not withdraw the tokens:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L117-L130
+
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L426-L442
+
+`lenderAcceptBid()` calls `collateralManager.deployAndDeposit()` which will deploy an escrow and deposit whatever is currently in the storage of `collateralManager`. There is no parameter passed by lender as to what collateral it expects:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L510
+
+## Impact
+
+Loaner expecting to accept a loan with collateral will accept a loan without any collateral. The borrower is free to never repay the loan. Borrower gains funds and lender loses funds.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Let lender specify what collateral it expects in `lenderAcceptBid()`. Or prevent anyone but `TellerV2` to call `commitCollateral()` (you may not want that for reason outside the scope of this audit). Or prevent `commitCollateral()` to lower the committed to collateral values.
+
+---------------------------------------
+
+# Medium: Unsafe use of AddressSet in LenderCommitmentForwarder allows unauthorized borrowers
+
+## Summary
+
+The contract `LenderCommitmentForwarder` uses `EnumerableSetUpgradeable.AddressSet` for the set of addresses allowed to borrow from a lender for a certain commitment.
+
+However, it unsafely uses the `delete` opcode on it, which does not clean the storage of mappings. This results in removed (previously authorized) borrowers to still be able to borrow from the lender.
+
+## Vulnerability Detail
+
+The library `EnumerableSetUpgradeable` states:
+
+```solidity
+ * [WARNING]
+ * ====
+ * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure
+ * unusable.
+ * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.
+ *
+ * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an
+ * array of EnumerableSet.
+ * ====
+```
+
+The contract can be found [here](https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable/blob/master/contracts/utils/structs/EnumerableSetUpgradeable.sol)
+
+The `AddressSet` struct uses an inner `Set` struct:
+```solidity
+    struct AddressSet {
+        Set _inner;
+    }
+
+    struct Set {
+        // Storage of set values
+        bytes32[] _values;
+        // Position of the value in the `values` array, plus 1 because index 0
+        // means a value is not in the set.
+        mapping(bytes32 => uint256) _indexes;
+    }
+```
+
+This means that `delete addrsSet` will only clear the `_values` array and not the `_indexes`. The function `addrsSet.contains(value)` will still return true for previously contained elements after the addrsSet was deleted.
+
+```solidity
+    function contains(AddressSet storage set, address value) internal view returns (bool) {
+        return _contains(set._inner, bytes32(uint256(uint160(value))));
+    }
+
+    function _contains(Set storage set, bytes32 value) private view returns (bool) {
+        return set._indexes[value] != 0;
+    }
+```
+
+The delete opcode is used by `LenderCommitmentForwarder` to update the commitment borrowers:
+```solidity
+    function updateCommitmentBorrowers(
+        uint256 _commitmentId,
+        address[] calldata _borrowerAddressList
+    ) public commitmentLender(_commitmentId) {
+        delete commitmentBorrowersList[_commitmentId];
+        _addBorrowersToCommitmentAllowlist(_commitmentId, _borrowerAddressList);
+    }
+```
+
+It is also used in `deleteCommitment` but that is probably safe:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/LenderCommitmentForwarder.sol#L267-L274
+
+The `addressSet.contains(borrower)` is used to determine if a borrower is allowed to open a loan from the commitment:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/LenderCommitmentForwarder.sol#L328-L332
+
+## Impact
+
+Borrowers that were once allowed to accept a commitment but later removed are still allowed to accept the commitment. 
+
+I understand the main reason for this restricted list is to allow for a limited set of addresses to automatically borrow from a lender without collateral. If unauthorized addresses borrow from the lender, they are free not to repay the loan. This results in a loss of funds for the lender.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+Testing:
+
+Add the following (failing) test in `LenderCommitmentForwarder_Combined_Test.sol`:
+
+```solidity
+    function test_acceptCommitmentWithBorrowersArray_change() public {
+        uint256 commitmentId = 0;
+
+        Commitment storage commitment = _createCommitment(
+            CommitmentCollateralType.ERC20,
+            maxAmount
+        );
+
+        address[] memory newBorrowersArray = new address[](1);
+        newBorrowersArray[0] = address(marketOwner);
+
+        lender._updateCommitmentBorrowers(commitmentId, borrowersArray);
+
+        lender._updateCommitmentBorrowers(commitmentId, newBorrowersArray);
+
+        bool acceptCommitAsMarketOwnerFails;
+
+        try
+            borrower._acceptCommitment(
+                commitmentId,
+                100, //principal
+                maxAmount, //collateralAmount
+                0, //collateralTokenId
+                address(collateralToken),
+                minInterestRate,
+                maxLoanDuration
+            )
+        {} catch {
+            acceptCommitAsMarketOwnerFails = true;
+        }
+
+        assertEq(
+            acceptCommitAsMarketOwnerFails,
+            true,
+            "Should fail when accepting as invalid borrower"
+        );
+    }
+```
+
+## Recommendation
+
+Follow OZ's recommendation to remove elements one by one or use an array of addrsset instead (i.e. committers provide a completely new set of allowed borrowers and you add that set to the list of stored sets and you check only the most recent set in `acceptCommitment()`).
+
+---------------------------------------
+
+# Medium: Loans are liquidateable even when honest if bidDefaultDuration < paymentCycle
+
+## Summary
+
+The calculation to determine if a loan is liquidateable does not take into account the payment cycle duration. Under certain circumstances where the payment cycle is shorter than the bid default duration, an honest borrower may repay its loan correctly every cycle but end up being defaulted and liquidated by the lender.
+
+## Vulnerability Detail
+
+The function to determined if a loan is defaulted checks if the last payment was done more than `bidDefaultDuration[_bidId]` seconds ago:
+
+```solidity
+    function isLoanDefaulted(uint256 _bidId)
+        public
+        view
+        override
+        returns (bool)
+    {
+        return _canLiquidateLoan(_bidId, 0);
+    }
+...
+    function _canLiquidateLoan(uint256 _bidId, uint32 _liquidationDelay)
+        internal
+        view
+        returns (bool)
+    {
+        Bid storage bid = bids[_bidId];
+
+        // Make sure loan cannot be liquidated if it is not active
+        if (bid.state != BidState.ACCEPTED) return false;
+
+        if (bidDefaultDuration[_bidId] == 0) return false;
+
+        return (uint32(block.timestamp) -
+            _liquidationDelay -
+            lastRepaidTimestamp(_bidId) >
+            bidDefaultDuration[_bidId]);
+    }
+```
+
+The value for `bidDefaultDuration` is set during the bid submission and is taken from the `marketRegistry`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L376
+
+This value is controlled by the owner of the market:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/MarketRegistry.sol#L487-L511
+
+## Impact
+
+An honest user doing its repayment every cycle may be considered defaulted if the market parameters allow it. This could be done by a mischievous market owner but also as a mistake. This will result in a borrower loan being defaulted and the borrower losing its collateral to the lender (or in the worst case to a liquidator) while the borrower honestly attempted to repay its loan.
+
+I expected values for the payment cycle to be close to a week and default duration close to a month, however by checking the live contracts on mainnet in the MarketRegistry for `marketId = 3` I see: `paymentCycle = PaymentDefaultDuration = 2592000 (720 hours)`. I see similar values for other market id.
+
+https://etherscan.io/address/0x5e30357d5136Bc4BfaDBA1ab341D0da09Fe7a9F1#readProxyContract
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Consider a loan as defaulted only when the last payment has been made `PaymentDefaultDuration` after it was due. Otherwise make sure market owners cannot set `PaymentDefaultDuration` below `paymentCycle`.
+
+---------------------------------------
+
+# Medium: Fee on transfer tokens not handled
+
+## Summary
+
+The contest details state:
+
+> ERC20: any
+ERC721: any 
+ERC777: none
+ERC1155: any 
+FEE-ON-TRANSFER: any
+
+However, contracts throughout the system do not take into account the potential fee paid for fee on transfer tokens. I.e. they do not use the balance of the receiving contract before/after transfer to compute the actual transferred value or do not provide for the potential fee.
+
+## Vulnerability Detail
+
+In `TellerV2` the transfer of the loan ERC20 token does not take into account a transfer fee:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L513-L540
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L747-L751
+
+Same in `CollateralManager`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L316-L386
+
+Same in `CollateralEscrowV1._depositCollateral` 
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/escrow/CollateralEscrowV1.sol#L111-L149
+
+And `CollateralEscrowV1._withdrawCollateral` 
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/escrow/CollateralEscrowV1.sol#L158-L194
+
+## Impact
+
+If using fee on transfer tokens, recipient of the loan / protocol fee / market fee will receive less token than anticipated through `TellerV2`.
+
+If using fee on transfer tokens for collateral, the `CollateralManager` will attempt to withdraw a set amount from the borrower and transfer that same amount to the escrow. If fees were taken, the whole amount will not be available to the `CollateralManager` and the transfer will fail.
+
+If fees only occur on certain transfer or do not occur for multiple transfers in a transaction, it can be that the `CollateralManager` successfully transfer the collateral to the escrow and loan is open, but the borrower / lender / liquidator will not be able to withdraw its collateral from the escrow (via `CollateralManager`) when the loan is repaid / defaulted / liquidated due to the fee.
+
+The result is an impossibility to use the protocol and a loss of funds under certain conditions for the borrower / lender / liquidator. 
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Explicitly state that you do not support fee on transfer tokens. Otherwise, check the balance of the receiving token before and after the transfer to compute the actual transferred value. This value needs to be stored for example in the escrow contract / collateral manager to be re-used during `_withdraw()` to send back the correct amount.
+
+If you decide to support fee on transfer tokens, please note that an attack vector is also present in the repayment of a loan on `TellerV2` where the borrower repays amount small enough that the whole fee covers the transfer and the lender receives (almost) no token back.
+
+---------------------------------------
+
+# Medium: Racing condition in between withdrawing a defaulted loan collateral and repaying the loan
+
+## Summary
+
+There is a racing condition in between the repayment of a late loan and the withdrawal of the collateral at stake by the lender.
+
+## Vulnerability Detail
+
+The function to withdraw collateral from a loan `CollateralManager.withdraw()` does not update the state of the bid.
+
+When a loan is defaulted, the user may realise they are late on payment and attempt to repay their loans. It could also be that chain congestion introduces delay in the user transaction and the user submitted the transaction when loan was not yet defaulted.
+
+If the lender (or anyone) calls `CollateralManager.withdraw()` at the same time (or as an evil front-run), the collateral will be sent to the lender.
+
+If the user only repays part of the loan, they are not entitled to withdraw their collateral and the `TellerV2` contract will not interact with the `CollateralManager`. As a result, the borrower will repay debt towards the lender for a defaulted loan for which the collateral has already been withdrawn.
+
+## Impact
+
+Borrower may repay defaulted loans if they send transactions close to the due date or after it. The defaulted loan may already have been liquidated by the lender. This is a loss of funds for the borrower.
+
+## Code Snippet
+
+The _repayLoan() function does not check if loan is defaulted or if the collateral has been withdrawn, unless `paymentAmount >= _owedAmount` and `_shouldWithdrawCollateral == true`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L712-L762
+
+CollateralManager.withdraw() does not update the status of the loan on TellerV2:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/CollateralManager.sol#L250-L260
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Prevent borrower to repay defaulted loan by calling `isLoanDefaulted()` and reverting when true.
+
+Otherwise, when they repay their loans check if the collateral has already been withdrawn. You can do this for example by adding a boolean mapping `withdrawn[bidId]` on `CollateralManager`.
+
+The most intuitive fix would be to update the bid state to `LIQUIDATED` when collateral is withdrawn, but that requires the CollateralManager to call the TellerV2, or to move the `withdraw` function from CollateralManager to TellerV2. `withdraw()` would set the status of the loan to PAID / LIQUIDATED and call `CollateralManager._withdraw()`.
+
+---------------------------------------
+
+CollateralManager.withdraw function lacks access control
+
+## Summary
+
+There is no access control on `CollateralManager.withdraw()`, the function can be called by anyone.
+
+## Vulnerability Detail
+
+The function checks if loan is paid and sends the collateral to borrower. If loan is defaulted, the function sends the collateral to lender.
+
+However, the protocol implemented a liquidation feature that allows others to liquidate a loan by repaying the lent token to the lender and getting the collateral in exchange. 
+
+It could be that a loan is defaulted and that a lender awaits for the 24 hours grace period before others can liquidate the loan and a griefer calls `CollateralManager.withdraw()`, directly sending the collateral to the lender.
+
+## Impact
+
+Lender cannot use the liquidation feature of the protocol and is forced to receive the collateral.
+
+If the collateral uses tokens with limited number of transfers or fee on transfer, this results in a direct loss for the lender.
+
+## Code Snippet
+
+withdraw() function with no access control:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/escrow/CollateralEscrowV1.sol#L84-L103
+
+liquidateLoanFull() has a 24 hour grace period due to the `LIQUIDATION_DELAY` used in `isLoanLiquidateable`:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L676-L704
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/TellerV2.sol#L938-L945
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Only allow lender to call `withdraw()` when the loan is defaulted. Probably a good idea to only allow borrower to call `withdraw()` when the loan is paid.
+
+
+---------------------------------------
+
+# Medium: lenderAcceptBid vulnearble to changes in market fees
+
+## Summary
+
+The details for the audit state: 
+
+> Market owners should NOT be able to race-condition attack borrowers or lenders by changing market settings while bids are being submitted or accepted (while tx are in mempool). Care has been taken to ensure that this is not possible (similar in theory to sandwich attacking but worse as if possible it could cause unexpected and non-consentual interest rate on a loan) and further-auditing of this is welcome.
+
+However, the market fee parameter can be abused by market owner to steal most of the loan amount paid by lender.
+
+## Vulnerability Detail
+
+In `lenderAcceptBid()` the fee paid by lender is taken from marketPlace:
+
+```solidity
+    function lenderAcceptBid(uint256 _bidId)
+        ...
+        amountToMarketplace = bid.loanDetails.principal.percent(
+            marketRegistry.getMarketplaceFee(bid.marketplaceId)
+        );
+        amountToBorrower =
+            bid.loanDetails.principal -
+            amountToProtocol -
+            amountToMarketplace;
+        ...
+        //transfer fee to marketplace
+        bid.loanDetails.lendingToken.safeTransferFrom(
+            sender,
+            marketRegistry.getMarketFeeRecipient(bid.marketplaceId),
+            amountToMarketplace
+        );
+        
+        //transfer funds to borrower
+        bid.loanDetails.lendingToken.safeTransferFrom(
+            sender,
+            bid.receiver,
+            amountToBorrower
+        );
+        ...
+```
+
+The fee parameters taken from marketRegistry is controlled by the market owner:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/MarketRegistry.sol#L621-L630
+
+## Impact
+
+If the value of the market place fee changes in between the time the bid is submitted and the time it is accepted, the borrower will receive less / more token than anticipated.
+
+An evil market owner can set the value of the marketplace fee to `100% - protocolFeesPercent` when a lender accept a loan to steal all the loan amount. This results in a loss of funds for the borrower (borrower is supposed to repay something they did not receive) .
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Take fee percent parameter as input of `_submitBid()` and compare them to the values in `marketRegistry` to make sure borrower agrees with them, revert if they differ. Store the values in the bid parameters and do not consult `marketRegistry` when loan is accepted (or revert when fee values differ).
+
+---------------------------------------
+
+# Medium: Bid submission vulnerable to market parameters changes
+
+## Summary
+
+The details for the audit state: 
+
+> Market owners should NOT be able to race-condition attack borrowers or lenders by changing market settings while bids are being submitted or accepted (while tx are in mempool). Care has been taken to ensure that this is not possible (similar in theory to sandwich attacking but worse as if possible it could cause unexpected and non-consentual interest rate on a loan) and further-auditing of this is welcome.
+
+However, there is little protection in place to protect the submitter of a bid from changes in market parameters.
+
+## Vulnerability Detail
+
+In _submitBid(), certain bid parameters are taken from the `marketRegistry`:
+
+```solidity
+    function _submitBid(...)
+        ...
+        (bid.terms.paymentCycle, bidPaymentCycleType[bidId]) = marketRegistry
+            .getPaymentCycle(_marketplaceId);
+
+        bid.terms.APR = _APR;
+
+        bidDefaultDuration[bidId] = marketRegistry.getPaymentDefaultDuration(
+            _marketplaceId
+        );
+
+        bidExpirationTime[bidId] = marketRegistry.getBidExpirationTime(
+            _marketplaceId
+        );
+
+        bid.paymentType = marketRegistry.getPaymentType(_marketplaceId);
+        
+        bid.terms.paymentCycleAmount = V2Calculations
+            .calculatePaymentCycleAmount(
+                bid.paymentType,
+                bidPaymentCycleType[bidId],
+                _principal,
+                _duration,
+                bid.terms.paymentCycle,
+                _APR
+            );
+        ...
+```
+
+All the parameters taken from marketRegistry are controlled by the market owner:
+https://github.com/sherlock-audit/2023-03-teller/blob/main/teller-protocol-v2/packages/contracts/contracts/MarketRegistry.sol#L487-L511
+
+## Impact
+
+If market parameters are changed in between the borrower submitting a bid transaction and the transaction being applied, borrower may be subject to changes in `bidDefaultDuration`, `bidExpirationTime`, `paymentType`, `paymentCycle`, `bidPaymentCycleType` and `paymentCycleAmount`.
+
+That is, the user may be committed to the bid for longer / shorter than expected. They may have a longer / shorter default duration (time for the loan being considered defaulted / eligible for liquidation). They have un-provisioned for payment type and cycle parameters.
+
+I believe most of this will have a medium impact on borrower (mild inconveniences / resolvable by directly repaying the loan) if the market owner is not evil and adapting the parameters reasonably.
+
+An evil market owner can set the value of `bidDefaultDuration` and `paymentCycle` very low (0) so that the loan will default immediately. It can then accept the bid, make user default immediately, and liquidate the loan to steal the user's collateral. This results in a loss of collateral for the borrower.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Take every single parameters as input of `_submitBid()` (including fee percents) and compare them to the values in `marketRegistry` to make sure borrower agrees with them, revert if they differ.
